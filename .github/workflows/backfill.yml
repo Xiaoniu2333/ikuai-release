@@ -1,0 +1,67 @@
+name: Backfill enterprise firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Enterprise version and Build
+        required: true
+        default: '3.7.26_Build202609111742'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ikuai-enterprise-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Mirror both enterprise architectures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PYTHONUNBUFFERED: '1'
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          import tempfile
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          import mirror as m
+          version = os.environ["VERSION"]
+          if not re.fullmatch(r"[34]\.[0-9.]+_Build\d{12}", version):
+              raise ValueError("Invalid enterprise version")
+          entries = m.merge_candidates(m.x86_candidates(version, "enterprise"))
+          for entry in entries:
+              entry["sources"].insert(0, {
+                  "url": "https://devapi.ikuai8.com/firmware/sign-url", "device": "X86ENT",
+                  "platform": m.platform_for(entry["filename"]), "system": "enterprise",
+                  "firmware": entry["filename"],
+              })
+          entries.sort(key=lambda e: "_x64_" not in e["filename"])
+          with tempfile.TemporaryDirectory() as directory:
+              result = m.sync_group(m.GitHub(os.environ["GITHUB_REPOSITORY"]), entries[0]["tag"], entries, Path(directory))
+          if result["failures"]:
+              raise RuntimeError(result["failures"])
+          print("Both enterprise architectures archived and verified")
+          PY
+      - name: Sort Releases by firmware Build dates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py compact-history
+      - name: Clean task scratch
+        if: always()
+        run: rm -rf .work

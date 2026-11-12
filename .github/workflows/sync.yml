@@ -1,0 +1,149 @@
+name: Mirror iKuai downloads
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 1,7,13,19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ikuai-mirror
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Discover and publish inventory
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      transfer_release_id: ${{ steps.transfer.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Keep only the newest completed run and all active runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py prune-runs
+      - name: Randomize scheduled scan start by 0-30 minutes
+        if: github.event_name == 'schedule'
+        run: python3 scripts/mirror.py jitter
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Restore cumulative inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .work
+          if gh release view mirror-index --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release download mirror-index --repo "$GITHUB_REPOSITORY" --pattern catalog.json --dir .work
+            mv .work/catalog.json .work/previous.json
+          fi
+      - name: Discover official cloud, firmware, history and tools
+        id: discover
+        continue-on-error: true
+        run: python3 scripts/mirror.py discover --previous .work/previous.json
+      - name: Publish verified inventory through Releases API
+        id: transfer
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py stage-inventory
+
+  mirror:
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Fetch this run's verified inventory
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSFER_RELEASE_ID: ${{ needs.discover.outputs.transfer_release_id }}
+        run: python3 scripts/mirror.py fetch-inventory
+      - name: Mirror and verify immutable Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONUNBUFFERED: '1'
+        run: python3 scripts/mirror.py sync --shard ${{ matrix.shard }} --shards 12
+      - name: Publish this run's shard report
+        if: ${{ always() && !cancelled() }}
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSFER_RELEASE_ID: ${{ needs.discover.outputs.transfer_release_id }}
+        run: python3 scripts/mirror.py stage-report --shard ${{ matrix.shard }}
+      - name: Clean task scratch
+        if: always()
+        run: rm -rf .work
+
+  index:
+    if: ${{ always() && needs.discover.result == 'success' && !cancelled() }}
+    needs: [discover, mirror]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Fetch verified inventory and shard reports
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSFER_RELEASE_ID: ${{ needs.discover.outputs.transfer_release_id }}
+        run: |
+          python3 scripts/mirror.py fetch-inventory
+          python3 scripts/mirror.py fetch-reports --shards 12
+      - name: Publish cumulative catalog and coverage report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py publish
+      - name: Clean task scratch
+        if: always()
+        run: rm -rf .work
+
+  maintenance:
+    if: ${{ always() && !cancelled() }}
+    needs: [discover, index]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Delete this run's temporary metadata draft
+        if: ${{ always() && needs.discover.outputs.transfer_release_id != '' }}
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSFER_RELEASE_ID: ${{ needs.discover.outputs.transfer_release_id }}
+        run: python3 scripts/mirror.py cleanup-transfer
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Maintain one public commit, release tags and latest Actions run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py maintain
